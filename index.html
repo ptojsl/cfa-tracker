@@ -382,7 +382,7 @@
 <div id="toast"></div>
 <div id="timer-pulse"></div>
 
-<!-- Loading overlay — shown while Firebase checks persisted session -->
+<!-- Loading overlay -->
 <div id="loading-screen" style="display:flex;position:fixed;inset:0;background:var(--bg);z-index:10000;align-items:center;justify-content:center;">
   <div style="text-align:center;">
     <div style="font-size:28px;margin-bottom:10px;">📚</div>
@@ -413,7 +413,35 @@
   </div>
 </div>
 
+<!-- FIX 1: Define window.sessions BEFORE any module scripts run.
+     The original code defined it in the non-module script AFTER the module,
+     but module scripts are deferred — so the order was actually:
+     module runs → Object.defineProperty fires → non-module script tries to
+     redefine the property → silent failure or stale closure over _sessions. -->
+<script>
+  (function() {
+    let _sessions = [];
+    Object.defineProperty(window, 'sessions', {
+      get() { return _sessions; },
+      set(v) { _sessions = Array.isArray(v) ? v : []; },
+      configurable: true
+    });
+  })();
+
+  // FIX 2: _db operation queue. If logSession is called before Firebase
+  // auth resolves (e.g. timer finishes on a slow connection), operations
+  // are buffered here and drained once startListening() sets window._db.
+  window._dbQueue = [];
+  window._db = null;
+</script>
+
 <!-- Firebase SDK -->
+<!-- FIX 3: Removed top-level `await setPersistence(...)`.
+     Top-level await in a module blocks ALL subsequent module evaluation,
+     and if setPersistence throws (e.g. in some private-browsing modes),
+     the entire module is silently aborted — meaning onAuthStateChanged
+     never registers and the loading screen never clears.
+     Solution: wrap everything in an async IIFE with a try/catch. -->
 <script type="module">
   import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
   import { getFirestore, collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
@@ -428,132 +456,168 @@
     appId: "1:1006978073479:web:8a1fa24b45d679685ac922"
   };
 
-  const app = initializeApp(firebaseConfig);
-  const db = getFirestore(app);
-  const auth = getAuth(app);
-
-  await setPersistence(auth, browserLocalPersistence);
-
-  let unsubscribe = null;
-
-  function setSyncStatus(state) {
-    const el = document.getElementById('sync-status');
-    if (!el) return;
-    el.className = 'sync-status ' + state;
-    el.textContent = state === 'synced' ? '✓ Synced' : state === 'syncing' ? '⟳ Syncing…' : '✗ Offline';
-  }
-
-  function startListening(uid) {
-    if (unsubscribe) unsubscribe();
-    const sessionsCol = collection(db, 'users', uid, 'sessions');
-    const q = query(sessionsCol, orderBy('date', 'asc'));
-    window._db = {
-      async addSession(session) {
-        setSyncStatus('syncing');
-        try { return (await addDoc(sessionsCol, session)).id; }
-        catch(e) { setSyncStatus('error'); throw e; }
-      },
-      async deleteSession(id) {
-        setSyncStatus('syncing');
-        try { await deleteDoc(doc(db, 'users', uid, 'sessions', id)); }
-        catch(e) { setSyncStatus('error'); throw e; }
-      }
-    };
-    unsubscribe = onSnapshot(q, (snapshot) => {
-      window.sessions = snapshot.docs.map(d => ({ ...d.data(), _id: d.id }));
-      setSyncStatus('synced');
-      if (typeof window.render === 'function') window.render();
-    }, (err) => { setSyncStatus('error'); console.error(err); });
-  }
-
-  // ── Auth state watcher ──
-  onAuthStateChanged(auth, (user) => {
-    const loadingScreen = document.getElementById('loading-screen');
-    const loginScreen   = document.getElementById('login-screen');
-    const appContainer  = document.getElementById('app-container');
-
-    // Hide loading overlay once Firebase has resolved session state
-    if (loadingScreen) loadingScreen.style.display = 'none';
-
-    if (user) {
-      loginScreen.style.display = 'none';
-      if (appContainer) appContainer.style.visibility = 'visible';
-      startListening(user.uid);
-    } else {
-      // Show login — use flex so the form is centred
-      loginScreen.style.display = 'flex';
-      if (appContainer) appContainer.style.visibility = 'hidden';
-      window.sessions = [];
-      // Show first-time setup hint if no password registered on this device
-      const hasRegistered = localStorage.getItem('cfa_pw_registered');
-      const hint = document.getElementById('setup-hint');
-      if (hint) hint.style.display = hasRegistered ? 'none' : 'block';
-      // Focus the password field automatically
-      setTimeout(() => { const pw = document.getElementById('pw-input'); if (pw) pw.focus(); }, 100);
-    }
-  });
-
-  // ── Password sign-in ──
-  // The password is hashed via SHA-256 and used as part of a deterministic
-  // Firebase email address so the same password always maps to the same account
-  // (and thus the same Firestore data) on every device.
-  async function sha256(str) {
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
-    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
-  }
-
-  function showLoginErr(msg) {
-    const el = document.getElementById('login-error');
-    if (el) el.textContent = msg;
-  }
-
-  window.doPasswordSignIn = async () => {
-    const pw = document.getElementById('pw-input').value.trim();
-    if (!pw || pw.length < 4) { showLoginErr('Password must be at least 4 characters.'); return; }
-    const hash = await sha256('cfa-tracker:' + pw);
-    // Use a fixed namespace email so the account is stable across devices
-    const email = hash.slice(0, 20) + '@cfa-tracker.app';
-    // The Firebase password is a salted second hash (never the raw password)
-    const fbpw  = 'pw:' + hash.slice(20, 52);
-    showLoginErr('');
-    const hasRegistered = localStorage.getItem('cfa_pw_registered');
+  (async () => {
     try {
-      if (hasRegistered) {
-        await signInWithEmailAndPassword(auth, email, fbpw);
-      } else {
-        // Try sign-in first (handles returning users on a new device)
-        try {
-          await signInWithEmailAndPassword(auth, email, fbpw);
-          localStorage.setItem('cfa_pw_registered', '1');
-        } catch(e) {
-          if (e.code === 'auth/user-not-found' || e.code === 'auth/invalid-credential' || e.code === 'auth/invalid-email') {
-            await createUserWithEmailAndPassword(auth, email, fbpw);
-            localStorage.setItem('cfa_pw_registered', '1');
-          } else { throw e; }
+      const app = initializeApp(firebaseConfig);
+      const db = getFirestore(app);
+      const auth = getAuth(app);
+
+      // FIX 3a: Try setPersistence but don't let it crash everything
+      try {
+        await setPersistence(auth, browserLocalPersistence);
+      } catch(e) {
+        console.warn('setPersistence failed (private browsing?). Continuing without persistence.', e);
+      }
+
+      let unsubscribe = null;
+
+      function setSyncStatus(state) {
+        const el = document.getElementById('sync-status');
+        if (!el) return;
+        el.className = 'sync-status ' + state;
+        el.textContent = state === 'synced' ? '✓ Synced' : state === 'syncing' ? '⟳ Syncing…' : '✗ Offline';
+      }
+
+      function startListening(uid) {
+        if (unsubscribe) unsubscribe();
+        const sessionsCol = collection(db, 'users', uid, 'sessions');
+        const q = query(sessionsCol, orderBy('date', 'asc'));
+
+        // FIX 4: Set window._db BEFORE subscribing, so any calls that
+        // come in during the initial snapshot load have a valid _db.
+        window._db = {
+          async addSession(session) {
+            setSyncStatus('syncing');
+            try {
+              const ref = await addDoc(sessionsCol, session);
+              return ref.id;
+            } catch(e) { setSyncStatus('error'); throw e; }
+          },
+          async deleteSession(id) {
+            setSyncStatus('syncing');
+            try { await deleteDoc(doc(db, 'users', uid, 'sessions', id)); }
+            catch(e) { setSyncStatus('error'); throw e; }
+          }
+        };
+
+        // FIX 5: Drain any queued operations that arrived before _db was ready
+        if (window._dbQueue && window._dbQueue.length > 0) {
+          console.log('Draining', window._dbQueue.length, 'queued db operations');
+          const q2 = window._dbQueue.splice(0);
+          q2.forEach(fn => fn(window._db).catch(console.error));
         }
+
+        unsubscribe = onSnapshot(q, (snapshot) => {
+          window.sessions = snapshot.docs.map(d => ({ ...d.data(), _id: d.id }));
+          setSyncStatus('synced');
+          if (typeof window.render === 'function') window.render();
+        }, (err) => {
+          setSyncStatus('error');
+          console.error('Firestore onSnapshot error:', err);
+        });
       }
-    } catch(e) {
-      if (e.code === 'auth/wrong-password' || e.code === 'auth/invalid-credential') {
-        showLoginErr('Incorrect password. Try again.');
-      } else {
-        showLoginErr('Error: ' + (e.message || e.code));
-        console.error(e);
+
+      onAuthStateChanged(auth, (user) => {
+        const loadingScreen = document.getElementById('loading-screen');
+        const loginScreen   = document.getElementById('login-screen');
+        const appContainer  = document.getElementById('app-container');
+
+        if (loadingScreen) loadingScreen.style.display = 'none';
+
+        if (user) {
+          loginScreen.style.display = 'none';
+          if (appContainer) appContainer.style.visibility = 'visible';
+          startListening(user.uid);
+        } else {
+          loginScreen.style.display = 'flex';
+          if (appContainer) appContainer.style.visibility = 'hidden';
+          window.sessions = [];
+          window._db = null; // clear so queued ops don't fire for logged-out user
+          if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+          const hasRegistered = localStorage.getItem('cfa_pw_registered');
+          const hint = document.getElementById('setup-hint');
+          if (hint) hint.style.display = hasRegistered ? 'none' : 'block';
+          setTimeout(() => { const pw = document.getElementById('pw-input'); if (pw) pw.focus(); }, 100);
+        }
+      });
+
+      async function sha256(str) {
+        const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
       }
+
+      function showLoginErr(msg) {
+        const el = document.getElementById('login-error');
+        if (el) el.textContent = msg;
+      }
+
+      window.doPasswordSignIn = async () => {
+        const pw = document.getElementById('pw-input').value.trim();
+        if (!pw || pw.length < 4) { showLoginErr('Password must be at least 4 characters.'); return; }
+        const hash = await sha256('cfa-tracker:' + pw);
+        const email = hash.slice(0, 20) + '@cfa-tracker.app';
+        const fbpw  = 'pw:' + hash.slice(20, 52);
+        showLoginErr('');
+
+        const hasRegistered = localStorage.getItem('cfa_pw_registered');
+        try {
+          if (hasRegistered) {
+            await signInWithEmailAndPassword(auth, email, fbpw);
+          } else {
+            try {
+              await signInWithEmailAndPassword(auth, email, fbpw);
+              localStorage.setItem('cfa_pw_registered', '1');
+            } catch(e) {
+              // FIX 6: Firebase v9/v10 unified SDK returns auth/invalid-credential
+              // for BOTH wrong-password AND user-not-found. We try createUser
+              // on that error code so new accounts are properly created.
+              if (
+                e.code === 'auth/user-not-found' ||
+                e.code === 'auth/invalid-credential' ||
+                e.code === 'auth/invalid-email'
+              ) {
+                try {
+                  await createUserWithEmailAndPassword(auth, email, fbpw);
+                  localStorage.setItem('cfa_pw_registered', '1');
+                } catch(createErr) {
+                  if (createErr.code === 'auth/email-already-in-use') {
+                    // Account exists — wrong password
+                    showLoginErr('Incorrect password. Try again.');
+                  } else {
+                    throw createErr;
+                  }
+                }
+              } else {
+                throw e;
+              }
+            }
+          }
+        } catch(e) {
+          if (e.code === 'auth/wrong-password' || e.code === 'auth/invalid-credential') {
+            showLoginErr('Incorrect password. Try again.');
+          } else {
+            showLoginErr('Error: ' + (e.message || e.code));
+            console.error('Auth error:', e);
+          }
+        }
+      };
+
+    } catch(initErr) {
+      // FIX 7: Surface Firebase init errors visibly instead of silently failing
+      console.error('Firebase initialization failed:', initErr);
+      const ls = document.getElementById('loading-screen');
+      if (ls) ls.innerHTML = `<div style="text-align:center;padding:2rem;max-width:280px;">
+        <div style="font-size:28px;margin-bottom:10px;">⚠️</div>
+        <div style="font-size:13px;color:#A32D2D;margin-bottom:8px;">Could not connect to Firebase.<br>Check your internet connection and reload.</div>
+        <div style="font-size:11px;color:#888;">${initErr.message || initErr.code || initErr}</div>
+      </div>`;
     }
-  };
+  })();
 </script>
 
 <script>
   const SETTINGS_KEY = 'cfa_settings_v1';
   let settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
-  // sessions is populated by the Firestore listener — always read via this getter
-  function getSessions() { return Array.isArray(window.sessions) ? window.sessions : []; }
-  // Alias so existing code referencing `sessions` works without change
-  Object.defineProperty(window, 'sessions', {
-    get() { return this._sessions || []; },
-    set(v) { this._sessions = Array.isArray(v) ? v : []; }
-  });
-  window.sessions = [];
   let pendingDelete = null, toastTimer = null;
   let timerInterval = null, timerRunning = false;
   let timerSecondsLeft = 25 * 60, timerDurationMins = 25;
@@ -564,8 +628,6 @@
   const CFA_WEIGHTS = {'Ethics & Professional Standards':17.5,'Quantitative Methods':8.5,'Economics':8.5,'Financial Statement Analysis':13.5,'Corporate Issuers':8.5,'Equity Investments':10.5,'Fixed Income':11,'Derivatives':5.5,'Alternative Investments':7.5,'Portfolio Management':9};
   const PIE_COLORS = ['#3B6D11','#639922','#97c459','#c0dd97','#BA7517','#EF9F27','#FAC775','#185FA5','#378ADD','#85B7EB','#533AB7','#9F77DD'];
 
-  // Bug fix: use local date instead of UTC — toISOString() returns UTC,
-  // which rolls over to the next day after 5pm PT / 8pm ET.
   function localDateStr(d) {
     return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
   }
@@ -573,7 +635,6 @@
   function today() { return localToday(); }
   function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
 
-  // ── Theme ──
   function applyTheme(t) {
     document.documentElement.setAttribute('data-theme', t);
     document.getElementById('theme-btn').textContent = t==='dark'?'☀️ Light':'🌙 Dark';
@@ -586,43 +647,42 @@
     else if(window.matchMedia('(prefers-color-scheme: dark)').matches){applyTheme('dark');}
   })();
 
-  // ── Helpers ──
   function setLogDay(day) {
     logDay=day;
     document.getElementById('day-today-btn').classList.toggle('active',day==='today');
     document.getElementById('day-yesterday-btn').classList.toggle('active',day==='yesterday');
   }
   function getLogDate() {
-    if(logDay==='yesterday'){const d=new Date();d.setDate(d.getDate()-1);return d.toISOString().slice(0,10);}
+    if(logDay==='yesterday'){const d=new Date();d.setDate(d.getDate()-1);return localDateStr(d);}
     return today();
   }
   function getTodayMins() { return sessions.filter(s=>s.date===today()).reduce((a,s)=>a+s.mins,0); }
   function getWeekKey() {
     const d=new Date(),day=d.getDay(),mon=new Date(d);
     mon.setDate(d.getDate()-(day===0?6:day-1));
-    return mon.toISOString().slice(0,10);
+    return localDateStr(mon);
   }
   function getMondayOf(dateStr) {
-    const d=new Date(dateStr),day=d.getDay(),mon=new Date(d);
+    const parts=dateStr.split('-').map(Number);
+    const d=new Date(parts[0],parts[1]-1,parts[2]);
+    const day=d.getDay(),mon=new Date(d);
     mon.setDate(d.getDate()-(day===0?6:day-1));mon.setHours(0,0,0,0);return mon;
   }
   function getWeekSessions() {
     const monday=getMondayOf(today());
-    return sessions.filter(s=>new Date(s.date)>=monday).length;
+    return sessions.filter(s=>{
+      const p=s.date.split('-').map(Number);
+      return new Date(p[0],p[1]-1,p[2])>=monday;
+    }).length;
   }
 
-  // ── Streak ──
   function calcStreakFrom(s) {
     const days=new Set(s.map(x=>x.date));
     const freezeDates=new Set((settings.freezeHistory||[]).map(f=>f.date));
     if(!days.size&&!freezeDates.size)return 0;
     let streak=0,d=new Date();
-    // Bug fix: if today has no session yet, don't break the streak —
-    // start counting from yesterday so an ongoing streak stays intact.
     const todayStr=localToday();
-    if(!days.has(todayStr)&&!freezeDates.has(todayStr)){
-      d.setDate(d.getDate()-1);
-    }
+    if(!days.has(todayStr)&&!freezeDates.has(todayStr)){d.setDate(d.getDate()-1);}
     for(let i=0;i<365;i++){
       const ds=localDateStr(d);
       if(days.has(ds)||freezeDates.has(ds)){streak++;}else{break;}
@@ -639,11 +699,10 @@
     return Math.round(sessions.reduce((a,s)=>a+s.mins,0)/60/weeks*10)/10;
   }
 
-  // ── Weekly report ──
   function renderWeeklyReport() {
     const lastMonday=new Date(getMondayOf(today()));lastMonday.setDate(lastMonday.getDate()-7);
     const lastSunday=new Date(lastMonday);lastSunday.setDate(lastMonday.getDate()+6);
-    const lmStr=lastMonday.toISOString().slice(0,10),lsStr=lastSunday.toISOString().slice(0,10);
+    const lmStr=localDateStr(lastMonday),lsStr=localDateStr(lastSunday);
     const lws=sessions.filter(s=>s.date>=lmStr&&s.date<=lsStr);
     const card=document.getElementById('weekly-report');
     if(!lws.length){card.style.display='none';return;}
@@ -659,17 +718,18 @@
       <div class="report-stat"><div class="report-stat-label">Hours studied</div><div class="report-stat-value">${Math.round(totalMins/60*10)/10}h</div></div>
       <div class="report-stat"><div class="report-stat-label">Sessions</div><div class="report-stat-value">${lws.length}</div></div>
       <div class="report-stat"><div class="report-stat-label">Days active</div><div class="report-stat-value">${uniqueDays}/7</div></div>`;
-    // Bug fix: parse date parts directly to avoid UTC-to-local shift misreading the weekday
     document.getElementById('report-best').innerHTML=`Best day: <strong>${bestDay?(()=>{const[y,m,dy]=bestDay[0].split('-').map(Number);return DAYS[new Date(y,m-1,dy).getDay()];})():'—'} (${bestDay?bestDay[1]:0} min)</strong> &nbsp;·&nbsp; Top topic: <strong>${topTopic?topTopic[0].split(' ')[0]:'—'}</strong>`;
   }
 
-  // ── Exam countdown ──
   function renderCountdown() {
     const dateStr=settings.examDate||'';
     if(dateStr)document.getElementById('exam-date').value=dateStr;
     const el=document.getElementById('days-count'),banner=document.getElementById('exam-banner');
     if(!dateStr){el.textContent='—';return;}
-    const diff=Math.ceil((new Date(dateStr)-new Date(today()))/86400000);
+    const[y,m,d]=dateStr.split('-').map(Number);
+    const examDate=new Date(y,m-1,d);
+    const todayDate=new Date();todayDate.setHours(0,0,0,0);
+    const diff=Math.ceil((examDate-todayDate)/86400000);
     el.textContent=Math.max(0,diff);
     banner.classList.toggle('urgent',diff<=30&&diff>0);
   }
@@ -677,7 +737,6 @@
     settings.examDate=e.target.value;saveSettings();renderCountdown();renderReadiness();
   });
 
-  // ── Goals ──
   function renderWeeklyGoal() {
     const goal=parseInt(document.getElementById('weekly-goal-input').value)||5,done=getWeekSessions();
     document.getElementById('weekly-count').textContent=`${done} / ${goal} sessions this week`;
@@ -704,7 +763,6 @@
   });
   if(settings.dailyGoal)document.getElementById('daily-goal-input').value=settings.dailyGoal;
 
-  // ── Freeze ──
   function freezesUsedThisWeek(){return(settings.freezeHistory||[]).filter(f=>f.week===getWeekKey()).length;}
   function isFreezeActiveToday(){return(settings.freezeHistory||[]).some(f=>f.date===today());}
   function renderFreeze() {
@@ -725,12 +783,17 @@
     saveSettings();renderFreeze();showToast('❄️ Streak freeze used — streak protected today.');
   }
 
-  // ── Readiness ──
   function calcReadiness() {
     const totalMins=sessions.reduce((a,s)=>a+s.mins,0),totalHrs=totalMins/60,streak=calcStreak();
     const topicsCovered=ALL_TOPICS.filter(t=>sessions.some(s=>s.topic===t)).length;
-    const examDateVal=document.getElementById('exam-date').value||settings.examDate||'';
-    const daysLeft=examDateVal?Math.max(0,Math.ceil((new Date(examDateVal)-new Date(today()))/86400000)):null;
+    const examDateVal=settings.examDate||'';
+    let daysLeft=null;
+    if(examDateVal){
+      const[y,m,d]=examDateVal.split('-').map(Number);
+      const examDate=new Date(y,m-1,d);
+      const td=new Date();td.setHours(0,0,0,0);
+      daysLeft=Math.max(0,Math.ceil((examDate-td)/86400000));
+    }
     const hrsScore=Math.min(100,Math.round(totalHrs/300*100));
     const topicScore=Math.round(topicsCovered/10*100);
     const consistencyScore=Math.min(100,Math.round(streak/30*100));
@@ -755,7 +818,6 @@
       <div class="readiness-row"><span class="readiness-label">Pacing</span><span class="readiness-val">${pt}</span></div>`;
   }
 
-  // ── Heat map ──
   function renderHeatmap() {
     const minsByDay={};
     sessions.forEach(s=>{minsByDay[s.date]=(minsByDay[s.date]||0)+s.mins;});
@@ -768,7 +830,7 @@
     let colMonths=[],cur=new Date(start),col=0;
     while(cur<=end){
       if(cur.getDay()===0){colMonths.push({col,month:cur.getMonth()});col++;}
-      const ds=cur.toISOString().slice(0,10),mins=minsByDay[ds]||0;
+      const ds=localDateStr(cur),mins=minsByDay[ds]||0;
       const lvl=mins===0?0:mins<=30?1:mins<=60?2:mins<=90?3:4;
       const div=document.createElement('div');div.className='hm-cell'+(lvl>0?` l${lvl}`:'');div.title=`${ds}: ${mins} min`;
       grid.appendChild(div);cur.setDate(cur.getDate()+1);
@@ -780,7 +842,6 @@
     });
   }
 
-  // ── Badges ──
   const BADGE_DEFS=[
     {id:'first',icon:'🎯',name:'First step',desc:'Log your first session',check:(s)=>s.length>=1},
     {id:'streak3',icon:'🔥',name:'3-day streak',desc:'3 days in a row',check:(s)=>calcStreakFrom(s)>=3},
@@ -792,8 +853,7 @@
     {id:'hrs200',icon:'🌟',name:'200 hours',desc:'12,000 total minutes',check:(s)=>s.reduce((a,x)=>a+x.mins,0)>=12000},
     {id:'hrs300',icon:'👑',name:'300 hours',desc:'18,000 total minutes',check:(s)=>s.reduce((a,x)=>a+x.mins,0)>=18000},
     {id:'bigday',icon:'💪',name:'Big day',desc:'90+ mins in one day this week',check:(s)=>{
-      const monday=getMondayOf(new Date().toISOString().slice(0,10));
-      const weekStr=monday.toISOString().slice(0,10);
+      const weekStr=localDateStr(getMondayOf(today()));
       const b={};s.filter(x=>x.date>=weekStr).forEach(x=>{b[x.date]=(b[x.date]||0)+x.mins;});
       return Object.values(b).some(m=>m>=90);
     }},
@@ -820,7 +880,7 @@
       if(b.id==='sessions150')return`${Math.max(0,456-sessions.length)} sessions left`;
       if(b.id==='allTopics'){const n=ALL_TOPICS.filter(t=>sessions.some(s=>s.topic===t)).length;return`${10-n} topics left`;}
       if(b.id==='bigday'){
-        const monday=getMondayOf(new Date().toISOString().slice(0,10)),weekStr=monday.toISOString().slice(0,10);
+        const weekStr=localDateStr(getMondayOf(today()));
         const bd={};sessions.filter(s=>s.date>=weekStr).forEach(s=>{bd[s.date]=(bd[s.date]||0)+s.mins;});
         const max=Object.values(bd).length?Math.max(...Object.values(bd)):0;
         return max>0?`Best day this week: ${max} min`:'90 min in one day this week';
@@ -834,7 +894,6 @@
     }).join('');
   }
 
-  // ── Toast ──
   function showToast(msg){
     const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
     clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),3200);
@@ -857,7 +916,6 @@
     return pool[total%pool.length];
   }
 
-  // ── Pie chart ──
   function renderPieChart(){
     if(!sessions.length){document.getElementById('pie-card').style.display='none';return;}
     document.getElementById('pie-card').style.display='';
@@ -885,7 +943,6 @@
     }).join('');
   }
 
-  // ── Topic bars ──
   function renderTopicBars(){
     if(!sessions.length){document.getElementById('progress-card').style.display='none';return;}
     document.getElementById('progress-card').style.display='';
@@ -904,7 +961,6 @@
     }).join('');
   }
 
-  // ── Effects ──
   const CONFETTI_COLORS=['#639922','#97c459','#c0dd97','#3B6D11','#BA7517','#EF9F27','#185FA5','#85B7EB'];
   function playCelebrationSound(big){
     try{
@@ -938,7 +994,6 @@
     for(let i=0;i<3;i++)setTimeout(()=>{const ring=document.createElement('div');ring.className='pulse-ring';c.appendChild(ring);ring.addEventListener('animationend',()=>ring.remove());},i*220);
   }
 
-  // ── Main render ──
   window.render = function render(){
     const totalMins=sessions.reduce((a,s)=>a+s.mins,0);
     document.getElementById('streak').textContent=calcStreak();
@@ -963,18 +1018,29 @@
   };
   function toggleHistory(){histExpanded=!histExpanded;render();}
 
-  // ── Log / Delete ──
-  async function logSession(topic,mins){
-    const session={date:getLogDate(),topic,mins};
-    try{
+  // FIX 8: logSession queues the operation if _db isn't ready yet
+  async function logSession(topic, mins) {
+    const session = { date: getLogDate(), topic, mins };
+
+    if (!window._db) {
+      // Firebase not ready — queue it for when startListening fires
+      window._dbQueue.push((db) => db.addSession(session));
+      showToast('⟳ Connecting — session will save shortly…');
+      return;
+    }
+
+    try {
       await window._db.addSession(session);
-      // render is triggered by Firestore listener
       showToast(getMotivationalMessage());
       setLogDay('today');
       playCelebrationSound(false);
       spawnConfetti(30);
-    }catch(e){showToast('⚠️ Could not save — check connection.');}
+    } catch(e) {
+      console.error('logSession error:', e);
+      showToast('⚠️ Could not save — check connection.');
+    }
   }
+
   function requestDelete(id){
     pendingDelete=id;render();
     setTimeout(()=>{if(pendingDelete===id){pendingDelete=null;render();}},3000);
@@ -988,7 +1054,6 @@
     if(pendingDelete!==null&&!e.target.classList.contains('delete-btn')){pendingDelete=null;render();}
   });
 
-  // ── Pomodoro ──
   function formatTime(secs){return`${Math.floor(secs/60).toString().padStart(2,'0')}:${(secs%60).toString().padStart(2,'0')}`;}
   function stepDuration(delta){if(timerRunning)return;const sl=document.getElementById('timer-duration');sl.value=Math.min(90,Math.max(5,parseInt(sl.value)+delta));onDurationChange();}
   function onDurationChange(){if(timerRunning)return;timerDurationMins=parseInt(document.getElementById('timer-duration').value);timerSecondsLeft=timerDurationMins*60;document.getElementById('timer-dur-label').textContent=timerDurationMins+' min';document.getElementById('timer-display').textContent=formatTime(timerSecondsLeft);}
@@ -1025,7 +1090,6 @@
     setTimeout(()=>resetTimer(),3000);
   }
 
-  // ── CSV ──
   function exportCSV(){
     if(!sessions.length){showToast("No sessions to export yet.");return;}
     const blob=new Blob(['Date,Topic,Minutes\n'+sessions.map(s=>`${s.date},"${s.topic}",${s.mins}`).join('\n')],{type:'text/csv'});
@@ -1055,9 +1119,7 @@
     reader.readAsText(file);event.target.value='';
   }
 
-  // ── Init ──
   renderCountdown();
-  // Initial render with empty sessions while Firestore connects
   render();
 </script>
 </body>
