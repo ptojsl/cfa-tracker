@@ -230,6 +230,17 @@
   </div>
   <p class="subtitle">Level I — Mark Meldrum</p>
 
+  <div id="cfa-week-banner" style="border-radius:10px;border:0.5px solid var(--border);background:var(--surface);padding:0.75rem 1rem;margin-bottom:1.25rem;display:flex;align-items:center;justify-content:space-between;gap:12px;">
+    <div>
+      <div style="font-size:28px;font-weight:500;color:var(--text);line-height:1;" id="cfa-week-num">—</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:2px;">CFA study week</div>
+    </div>
+    <div style="text-align:right;">
+      <div style="font-size:11px;color:var(--text2);margin-bottom:3px;">Started</div>
+      <input type="date" id="cfa-start-date" style="font-size:12px;color:var(--text2);border:none;background:transparent;cursor:pointer;outline:none;text-align:right;display:block;" />
+    </div>
+  </div>
+
   <div id="exam-banner">
     <div><div class="banner-days" id="days-count">—</div><div class="banner-label">days until exam</div></div>
     <div class="banner-date-wrap">
@@ -737,6 +748,35 @@
     settings.examDate=e.target.value;saveSettings();renderCountdown();renderReadiness();
   });
 
+  // CFA week tracker
+  function renderCFAWeek() {
+    const startStr = settings.cfaStartDate || '';
+    const el = document.getElementById('cfa-week-num');
+    if (startStr) document.getElementById('cfa-start-date').value = startStr;
+    
+    if (!startStr) {
+      el.textContent = '—';
+      return;
+    }
+    
+    const [y, m, d] = startStr.split('-').map(Number);
+    const startDate = new Date(y, m - 1, d);
+    startDate.setHours(0, 0, 0, 0);
+    const todayDate = new Date();
+    todayDate.setHours(0, 0, 0, 0);
+    
+    const daysDiff = Math.floor((todayDate - startDate) / 86400000);
+    const weekNum = Math.floor(daysDiff / 7) + 1;
+    
+    el.textContent = weekNum > 0 ? weekNum : '—';
+  }
+  
+  document.getElementById('cfa-start-date').addEventListener('change', e => {
+    settings.cfaStartDate = e.target.value;
+    saveSettings();
+    renderCFAWeek();
+  });
+
   function renderWeeklyGoal() {
     const goal=parseInt(document.getElementById('weekly-goal-input').value)||5,done=getWeekSessions();
     document.getElementById('weekly-count').textContent=`${done} / ${goal} sessions this week`;
@@ -771,7 +811,8 @@
     if(frozenToday){info.innerHTML='Streak freeze: <strong>active today ❄️</strong>';btn.textContent='Used';btn.disabled=true;btn.style.borderColor='';}
     else if(available===0){info.innerHTML='Streak freeze: <strong>0</strong> available this week';btn.textContent='Use freeze';btn.disabled=true;btn.style.borderColor='';}
     else{
-      const urgent=streak>=3&&!sessions.some(s=>s.date===today());
+      // Only show urgent if: (1) streak is at risk AND (2) no session today AND (3) no freeze active today
+      const urgent=streak>=3&&!sessions.some(s=>s.date===today())&&!frozenToday;
       info.innerHTML=urgent?`Streak freeze: <strong style="color:#D85A30">protect your ${streak}-day streak!</strong>`:`Streak freeze: <strong>${available}</strong> available this week`;
       btn.textContent='Use freeze';btn.disabled=false;btn.style.borderColor=urgent?'#f0a070':'';
     }
@@ -779,8 +820,10 @@
   function useFreeze(){
     if(freezesUsedThisWeek()>=1)return;
     if(!settings.freezeHistory)settings.freezeHistory=[];
-    settings.freezeHistory.push({week:getWeekKey(),date:today()});
-    saveSettings();renderFreeze();showToast('❄️ Streak freeze used — streak protected today.');
+    const freezeEntry = {week:getWeekKey(),date:today()};
+    settings.freezeHistory.push(freezeEntry);
+    console.log('Freeze activated:', freezeEntry, 'Total freezes:', settings.freezeHistory);
+    saveSettings();renderFreeze();render();showToast('❄️ Streak freeze used — streak protected today.');
   }
 
   function calcReadiness() {
@@ -823,13 +866,16 @@
     sessions.forEach(s=>{minsByDay[s.date]=(minsByDay[s.date]||0)+s.mins;});
     const end=new Date();end.setHours(0,0,0,0);
     const start=new Date(end);start.setDate(end.getDate()-90);
-    while(start.getDay()!==0)start.setDate(start.getDate()-1);
+    // Start on Monday instead of Sunday
+    while(start.getDay()!==1)start.setDate(start.getDate()-1);
     const grid=document.getElementById('heatmap'),mlEl=document.getElementById('hm-month-labels');
     grid.innerHTML='';mlEl.innerHTML='';
-    document.getElementById('hm-day-labels').innerHTML=['S','M','T','W','T','F','S'].map((d,i)=>`<div class="hm-day-label" style="${[1,3,5].includes(i)?'':'visibility:hidden'}">${d}</div>`).join('');
+    // Monday through Sunday labels
+    document.getElementById('hm-day-labels').innerHTML=['M','T','W','T','F','S','S'].map((d,i)=>`<div class="hm-day-label" style="${[0,2,4].includes(i)?'':'visibility:hidden'}">${d}</div>`).join('');
     let colMonths=[],cur=new Date(start),col=0;
     while(cur<=end){
-      if(cur.getDay()===0){colMonths.push({col,month:cur.getMonth()});col++;}
+      // Start new column on Monday (day 1)
+      if(cur.getDay()===1){colMonths.push({col,month:cur.getMonth()});col++;}
       const ds=localDateStr(cur),mins=minsByDay[ds]||0;
       const lvl=mins===0?0:mins<=30?1:mins<=60?2:mins<=90?3:4;
       const div=document.createElement('div');div.className='hm-cell'+(lvl>0?` l${lvl}`:'');div.title=`${ds}: ${mins} min`;
@@ -1002,7 +1048,7 @@
     document.getElementById('sessions').textContent=sessions.length;
     renderWeeklyGoal();renderDailyGoal();renderFreeze();
     renderReadiness();renderWeeklyReport();renderHeatmap();
-    renderBadges();renderPieChart();renderTopicBars();
+    renderBadges();renderPieChart();renderTopicBars();renderCFAWeek();
     const hist=document.getElementById('history'),expandBtn=document.getElementById('hist-expand-btn');
     if(!sessions.length){hist.innerHTML='<div class="empty">No sessions yet — start a timer or log manually above.</div>';expandBtn.style.display='none';return;}
     const COLLAPSED=3,all=sessions.map((s,i)=>({...s,origIndex:i})).reverse();
@@ -1120,6 +1166,7 @@
   }
 
   renderCountdown();
+  renderCFAWeek();
   render();
 </script>
 </body>
